@@ -52,7 +52,7 @@ set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
 set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
 
 # Find dependencies
-#find_package(spdlog REQUIRED)
+find_package(spdlog)
 if (NOT spdlog_FOUND)
     include_directories(${CMAKE_SOURCE_DIR}/bin/include)
 endif ()

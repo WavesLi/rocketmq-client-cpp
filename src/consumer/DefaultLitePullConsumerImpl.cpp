@@ -22,11 +22,11 @@
 
 #include "AssignedMessageQueue.hpp"
 #include "FilterAPI.hpp"
+#include "LocalFileOffsetStore.h"
 #include "MQAdminImpl.h"
 #include "MQClientAPIImpl.h"
 #include "MQClientInstance.h"
 #include "NamespaceUtil.h"
-#include "LocalFileOffsetStore.h"
 #include "PullAPIWrapper.h"
 #include "PullSysFlag.h"
 #include "RebalanceLitePullImpl.h"
@@ -46,20 +46,20 @@ class DefaultLitePullConsumerImpl::MessageQueueListenerImpl : public MessageQueu
   ~MessageQueueListenerImpl() = default;
 
   void messageQueueChanged(const std::string& topic,
-                           std::vector<MQMessageQueue>& mq_all,
-                           std::vector<MQMessageQueue>& mq_divided) override {
+                           std::vector<MQMessageQueue>& all_mqs,
+                           std::vector<MQMessageQueue>& allocated_mqs) override {
     auto consumer = default_lite_pull_consumer_.lock();
     if (nullptr == consumer) {
       return;
     }
     switch (consumer->messageModel()) {
       case BROADCASTING:
-        consumer->updateAssignedMessageQueue(topic, mq_all);
-        consumer->updatePullTask(topic, mq_all);
+        consumer->updateAssignedMessageQueue(topic, all_mqs);
+        consumer->updatePullTask(topic, all_mqs);
         break;
       case CLUSTERING:
-        consumer->updateAssignedMessageQueue(topic, mq_divided);
-        consumer->updatePullTask(topic, mq_divided);
+        consumer->updateAssignedMessageQueue(topic, allocated_mqs);
+        consumer->updatePullTask(topic, allocated_mqs);
         break;
       default:
         break;
@@ -245,7 +245,7 @@ class DefaultLitePullConsumerImpl::PullTaskImpl : public std::enable_shared_from
  private:
   std::weak_ptr<DefaultLitePullConsumerImpl> default_lite_pull_consumer_;
   MQMessageQueue message_queue_;
-  volatile bool cancelled_;
+  std::atomic<bool> cancelled_;
 };
 
 DefaultLitePullConsumerImpl::DefaultLitePullConsumerImpl(DefaultLitePullConsumerConfigPtr config)
@@ -327,8 +327,9 @@ void DefaultLitePullConsumerImpl::start() {
       bool registerOK = client_instance_->registerConsumer(client_config_->group_name(), this);
       if (!registerOK) {
         service_state_ = CREATE_JUST;
-        THROW_MQEXCEPTION(MQClientException, "The cousumer group[" + client_config_->group_name() +
-                                                 "] has been created before, specify another name please.",
+        THROW_MQEXCEPTION(MQClientException,
+                          "The cousumer group[" + client_config_->group_name() +
+                              "] has been created before, specify another name please.",
                           -1);
       }
 
@@ -486,7 +487,7 @@ void DefaultLitePullConsumerImpl::shutdown() {
       scheduled_thread_pool_executor_.shutdown();
       scheduled_executor_service_.shutdown();
       client_instance_->shutdown();
-      rebalance_impl_->destroy();
+      rebalance_impl_->shutdown();
       service_state_ = ServiceState::SHUTDOWN_ALREADY;
       LOG_INFO_NEW("the consumer [{}] shutdown OK", client_config_->group_name());
       break;
@@ -501,6 +502,8 @@ void DefaultLitePullConsumerImpl::subscribe(const std::string& topic, const std:
     if (topic.empty()) {
       THROW_MQEXCEPTION(MQClientException, "Topic can not be null or empty.", -1);
     }
+
+    // record subscription data
     set_subscription_type(SubscriptionType::SUBSCRIBE);
     auto* subscription_data = FilterAPI::buildSubscriptionData(topic, subExpression);
     rebalance_impl_->setSubscriptionData(topic, subscription_data);
@@ -550,14 +553,14 @@ void DefaultLitePullConsumerImpl::updateAssignedMessageQueue(const std::string& 
   assigned_message_queue_->updateAssignedMessageQueue(topic, assigned_message_queue);
 }
 
-void DefaultLitePullConsumerImpl::updatePullTask(const std::string& topic, std::vector<MQMessageQueue>& mq_new_set) {
-  std::sort(mq_new_set.begin(), mq_new_set.end());
+void DefaultLitePullConsumerImpl::updatePullTask(const std::string& topic, std::vector<MQMessageQueue>& allocated_mqs) {
+  std::sort(allocated_mqs.begin(), allocated_mqs.end());
   std::lock_guard<std::mutex> lock(task_table_mutex_);
   for (auto it = task_table_.begin(); it != task_table_.end();) {
     auto& mq = it->first;
     if (mq.topic() == topic) {
       // remove unnecessary PullTask
-      if (!std::binary_search(mq_new_set.begin(), mq_new_set.end(), mq)) {
+      if (!std::binary_search(allocated_mqs.begin(), allocated_mqs.end(), mq)) {
         it->second->set_cancelled(true);
         it = task_table_.erase(it);
         continue;
@@ -565,11 +568,11 @@ void DefaultLitePullConsumerImpl::updatePullTask(const std::string& topic, std::
     }
     it++;
   }
-  startPullTask(mq_new_set);
+  startPullTask(allocated_mqs);
 }
 
-void DefaultLitePullConsumerImpl::startPullTask(std::vector<MQMessageQueue>& mq_set) {
-  for (const auto& mq : mq_set) {
+void DefaultLitePullConsumerImpl::startPullTask(std::vector<MQMessageQueue>& allocated_mqs) {
+  for (const auto& mq : allocated_mqs) {
     // add new PullTask
     if (task_table_.find(mq) == task_table_.end()) {
       auto pull_task = std::make_shared<PullTaskImpl>(shared_from_this(), mq);
@@ -845,10 +848,9 @@ ConsumerRunningInfo* DefaultLitePullConsumerImpl::consumerRunningInfo() {
 
   info->setSubscriptionSet(subscriptions());
 
-  auto processQueueTable = rebalance_impl_->getProcessQueueTable();
-  for (const auto& it : processQueueTable) {
-    const auto& mq = it.first;
-    const auto& pq = it.second;
+  auto mqs = assigned_message_queue_->messageQueues();
+  for (const auto& mq : mqs) {
+    auto pq = assigned_message_queue_->getProcessQueue(mq);
 
     ProcessQueueInfo pq_info;
     pq_info.setCommitOffset(offset_store_->readOffset(mq, MEMORY_FIRST_THEN_STORE));

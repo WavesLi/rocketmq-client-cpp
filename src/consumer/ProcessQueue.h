@@ -63,13 +63,16 @@ class ROCKETMQCLIENT_API ProcessQueue {
  public:
   inline const MQMessageQueue& message_queue() const { return message_queue_; }
 
-  inline std::timed_mutex& lock_consume() { return lock_consume_; }
+  inline bool dropped() const { return dropped_.load(); }
+  inline void set_dropped(bool dropped) { dropped_.store(dropped); }
+
+  inline bool locked() const { return locked_.load(); }
+  inline void set_locked(bool locked) { locked_.store(locked); }
+
+  inline std::timed_mutex& consume_mutex() { return consume_mutex_; }
 
   inline long try_unlock_times() const { return try_unlock_times_.load(); }
   inline void inc_try_unlock_times() { try_unlock_times_.fetch_add(1); }
-
-  inline bool dropped() const { return dropped_.load(); }
-  inline void set_dropped(bool dropped) { dropped_.store(dropped); }
 
   inline uint64_t last_pull_timestamp() const { return last_pull_timestamp_; }
   inline void set_last_pull_timestamp(uint64_t lastPullTimestamp) { last_pull_timestamp_ = lastPullTimestamp; }
@@ -79,25 +82,30 @@ class ROCKETMQCLIENT_API ProcessQueue {
     last_consume_timestamp_ = lastConsumeTimestamp;
   }
 
-  inline bool locked() const { return locked_.load(); }
-  inline void set_locked(bool locked) { locked_.store(locked); }
-
   inline uint64_t last_lock_timestamp() const { return last_lock_timestamp_; }
   inline void set_last_lock_timestamp(int64_t lastLockTimestamp) { last_lock_timestamp_ = lastLockTimestamp; }
 
  private:
-  MQMessageQueue message_queue_;
-  std::mutex lock_tree_map_;
-  std::map<int64_t, MessageExtPtr> msg_tree_map_;
-  std::timed_mutex lock_consume_;
-  std::map<int64_t, MessageExtPtr> consuming_msg_orderly_tree_map_;
-  std::atomic<long> try_unlock_times_;
-  volatile int64_t queue_offset_max_;
+  const MQMessageQueue message_queue_;
+
+  // message cache
+  std::mutex message_cache_mutex_;
+  std::map<int64_t, MessageExtPtr> message_cache_;
+  std::map<int64_t, MessageExtPtr> consuming_message_cache_;  // for orderly
+  int64_t queue_offset_max_;
+
+  // flag
   std::atomic<bool> dropped_;
-  volatile uint64_t last_pull_timestamp_;
-  volatile uint64_t last_consume_timestamp_;
   std::atomic<bool> locked_;
-  volatile uint64_t last_lock_timestamp_;  // ms
+
+  // consume lock
+  std::timed_mutex consume_mutex_;
+  std::atomic<long> try_unlock_times_;
+
+  // timestamp record
+  std::atomic<uint64_t> last_pull_timestamp_;
+  std::atomic<uint64_t> last_consume_timestamp_;
+  std::atomic<uint64_t> last_lock_timestamp_;  // ms
 };
 
 }  // namespace rocketmq

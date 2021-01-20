@@ -18,29 +18,28 @@
 #define ROCKETMQ_CONSUMER_ASSIGNEDMESSAGEQUEUE_H_
 
 #include <algorithm>  // std::move, std::binary_search
-#include <mutex>      // std::mutex
+#include <memory>
+#include <mutex>  // std::mutex
 
 #include "MQMessageQueue.h"
 #include "ProcessQueue.h"
-#include "RebalanceImpl.h"
+#include "RebalanceLitePullImpl.h"
 
 namespace rocketmq {
 
 class MessageQueueState {
  public:
-  MessageQueueState(const MQMessageQueue& message_queue, ProcessQueuePtr process_queue)
+  MessageQueueState(const MQMessageQueue& message_queue, const ProcessQueuePtr& process_queue)
       : message_queue_(message_queue),
-        process_queue_(std::move(process_queue)),
+        process_queue_(process_queue),
         paused_(false),
         pull_offset_(-1),
         consume_offset_(-1),
         seek_offset_(-1) {}
 
   inline const MQMessageQueue& message_queue() const { return message_queue_; }
-  inline void set_message_queue(const MQMessageQueue message_queue) { message_queue_ = message_queue; }
 
   inline ProcessQueuePtr process_queue() const { return process_queue_; }
-  inline void process_queue(ProcessQueuePtr process_queue) { process_queue_ = std::move(process_queue); }
 
   inline bool is_paused() const { return paused_; }
   inline void set_paused(bool paused) { paused_ = paused; }
@@ -55,12 +54,14 @@ class MessageQueueState {
   inline void set_seek_offset(int64_t seek_offset) { seek_offset_ = seek_offset; }
 
  private:
-  MQMessageQueue message_queue_;
-  ProcessQueuePtr process_queue_;
-  volatile bool paused_;
-  volatile int64_t pull_offset_;
-  volatile int64_t consume_offset_;
-  volatile int64_t seek_offset_;
+  const MQMessageQueue message_queue_;
+
+  const ProcessQueuePtr process_queue_;
+
+  bool paused_;
+  int64_t pull_offset_;
+  int64_t consume_offset_;
+  int64_t seek_offset_;
 };
 
 class AssignedMessageQueue {
@@ -181,6 +182,11 @@ class AssignedMessageQueue {
       if (mq.topic() == topic) {
         if (!std::binary_search(assigned.begin(), assigned.end(), mq)) {
           it = assigned_message_queue_state_.erase(it);
+          auto pq = it->second.process_queue();
+          pq->set_dropped(true);
+          if (rebalance_impl_ != nullptr) {
+            rebalance_impl_->removeUnnecessaryMessageQueue(mq, pq);
+          }
           continue;
         }
       }
@@ -193,12 +199,9 @@ class AssignedMessageQueue {
   void addAssignedMessageQueue(const std::vector<MQMessageQueue>& assigned) {
     for (const auto& message_queue : assigned) {
       if (assigned_message_queue_state_.find(message_queue) == assigned_message_queue_state_.end()) {
-        ProcessQueuePtr process_queue;
+        ProcessQueuePtr process_queue = std::make_shared<ProcessQueue>(message_queue);
         if (rebalance_impl_ != nullptr) {
-          process_queue = rebalance_impl_->getProcessQueue(message_queue);
-        }
-        if (nullptr == process_queue) {
-          process_queue.reset(new ProcessQueue(message_queue));
+          rebalance_impl_->removeDirtyOffset(message_queue);
         }
         assigned_message_queue_state_.emplace(message_queue, MessageQueueState(message_queue, process_queue));
       }
@@ -206,12 +209,13 @@ class AssignedMessageQueue {
   }
 
  public:
-  inline void set_rebalance_impl(RebalanceImpl* rebalance_impl) { rebalance_impl_ = rebalance_impl; }
+  inline void set_rebalance_impl(RebalanceLitePullImpl* rebalance_impl) { rebalance_impl_ = rebalance_impl; }
 
  private:
   std::map<MQMessageQueue, MessageQueueState> assigned_message_queue_state_;
   std::mutex assigned_message_queue_state_mutex_;
-  RebalanceImpl* rebalance_impl_;
+
+  RebalanceLitePullImpl* rebalance_impl_;
 };
 
 }  // namespace rocketmq
